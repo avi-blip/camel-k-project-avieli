@@ -470,8 +470,8 @@ dashboards:
             {
               "id": 16,
               "type": "logs",
-              "title": "Integration Logs",
-              "description": "All log lines from the selected integration pods. Filter by integration dropdown above.",
+              "title": "Integration Logs – WARN / ERROR",
+              "description": "WARN and ERROR log lines from the selected integration pods. INFO and DEBUG are filtered out to reduce noise. Change the filter in the query to see all levels.",
               "gridPos": { "h": 10, "w": 24, "x": 0, "y": 34 },
               "datasource": { "type": "loki", "uid": "loki" },
               "options": {
@@ -482,7 +482,7 @@ dashboards:
               },
               "targets": [
                 {
-                  "expr": "{namespace=\"camel-k\", pod=~\"$integration.*\"}",
+                  "expr": "{namespace=\"camel-k\", pod=~\"$integration.*\"} |~ \"(WARN|ERROR)\"",
                   "refId": "A"
                 }
               ]
