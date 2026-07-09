@@ -10,10 +10,10 @@ for a RHEL x86_64 server running k3s (Nutanix).
 |---|---|
 | `kafka.yaml` | Single-node KRaft Kafka (`apache/kafka:3.9.1`), ns `kafka` — client listener secured with SASL/SCRAM-SHA-256 |
 | `kafka-bridge.yaml` | The Camel route (YAML DSL): kafka:source-topic → log → kafka:sink-topic, authenticates via SCRAM |
-| `rate-limit/` | Per-client rate limiting (SLA) via a Redis token bucket — Kafka + HTTP/HTTPS routes, test scripts — **see `rate-limit/README.md`** |
-| `monitoring/` | Helm values for local Grafana + Prometheus + Loki (dashboard `camel-kafka-bridge`, login admin/camelk) |
+| `rate-limit/` | Distributed rate limiting (SLA) via a Redis token bucket — **one Java plugin (`plugin/RateLimit.java`) + per-route YAML (`routes/*.yaml`)**, for Kafka + HTTP/HTTPS — **see `rate-limit/README.md`** |
+| `monitoring/` | Helm values for local Grafana + Prometheus + Loki (dashboard `camel-k-routes`, login admin/camelk) |
 | `airgap-bundle/` | Everything for the offline RHEL/k3s deployment — **start with `airgap-bundle/AIRGAP-DEPLOY.md`** |
-| `airgap-bundle/manifests/` | registry (NodePort 30500), nginx Maven mirror + settings.xml, kafka, 5-second producer, routes (incl. rate-limited), redis, TLS ingress |
+| `airgap-bundle/manifests/` | registry (NodePort 30500), nginx Maven mirror + settings.xml, kafka, 5-second producer, kafka-bridge, redis, and the rate-limit plugin + `routes/` + echo-server + nodeport |
 
 ## Kafka security (SASL/SCRAM-SHA-256)
 
@@ -37,14 +37,17 @@ kamel run kafka-bridge.yaml -n camel-k --name kafka-bridge \
   --config secret:kafka-scram-credentials
 ```
 
-## Per-client rate limiting (Redis token bucket)
+## Distributed rate limiting (Redis token bucket — plugin + YAML routes)
 
-`rate-limit/` adds the `rate-limited-bridge` integration: one route per client, each with
-its own SLA enforced **globally across all pods** — the limiter is a token bucket run as
-an atomic Lua script in Redis, so replica count never changes a client's aggregate rate
+`rate-limit/` adds the `multi-route-bridge` integration, packaged as **one reusable Java
+plugin plus per-route YAML**. `plugin/RateLimit.java` registers a `rateLimit` bean (a token
+bucket run as an atomic Lua script in Redis) and defines no routes; each `routes/*.yaml`
+file is a route that calls the bean and configures its own key/rate/burst inline. The SLA
+is enforced **globally across all pods**, so replica count never changes the aggregate rate
 (verified identical at 1 and 2 pods). Kafka sources block (backpressure); HTTP/HTTPS
-(TLS via Traefik ingress) reject with `429 + Retry-After`. Deploy, test scripts, and
-design rationale: `rate-limit/README.md`; offline deployment: §8.1 of the air-gap guide.
+(pod-terminated TLS on :8443) reject with `429 + Retry-After`. Add a route = drop another
+YAML in `routes/`. Deploy, test script, and design rationale: `rate-limit/README.md`;
+offline deployment: §8.1 of the air-gap guide.
 
 ## Large artifacts NOT in git (GitHub 100 MB limit)
 
@@ -65,8 +68,8 @@ while read -r i; do docker pull --platform linux/amd64 "$i"; done < image-list-a
 docker save --platform linux/amd64 -o all-images-amd64.tar $(tr '\n' ' ' < image-list-amd64.txt)
 
 # Maven repository, ~200 MB — extracted from a camel-k operator that has built ALL the
-# routes at least once (kafka-bridge AND rate-limit/RateLimitedRoutes.java, so the repo
-# includes camel-quarkus-platform-http + redis.clients:jedis)
+# routes at least once (kafka-bridge AND the rate-limit plugin+routes, so the repo
+# includes camel-quarkus-platform-http + redis.clients:jedis + camel:http)
 OP=$(kubectl get pod -n camel-k -l app=camel-k -o jsonpath='{.items[0].metadata.name}')
 kubectl exec -n camel-k $OP -- tar czf - -C /etc/maven m2 > ../maven/camel-k-m2.tgz
 

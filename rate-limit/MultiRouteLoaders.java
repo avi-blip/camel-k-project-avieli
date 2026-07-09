@@ -2,9 +2,9 @@ import org.apache.camel.builder.RouteBuilder;
 
 /**
  * Continuous load generators — one per bridge route.
- * Each timer fires every 200 ms (~5 msg/s), staying just at the HTTP SLA limit so
- * Grafana shows a realistic mix of 202 and 429 exchanges. The kafka-to-kafka
- * loader is well under its 10 msg/s SLA so all messages are accepted there.
+ * Each timer fires every 50 ms (~20 msg/s), well above the per-route SLA so the
+ * rate limiter is clearly exercised: HTTP routes return ~75% 429s, Kafka consumer
+ * is throttled to the configured limit via blocking backpressure.
  *
  * HTTP loaders call the bridge via the internal ClusterIP service (port 80 → pod 8080).
  * The rate-limit logic in the bridge is identical whether the request arrives on
@@ -31,20 +31,20 @@ public class MultiRouteLoaders extends RouteBuilder {
     public void configure() throws Exception {
 
         // ── Loader 1: kafka-to-kafka ─────────────────────────────────────────────
-        from("timer:kk-load?period=200")
+        from("timer:kk-load?period=50")
             .routeId("load-kafka-to-kafka")
             .setBody(simple("kk-${date:now:yyyyMMdd-HHmmss.SSS}"))
             .to("kafka:kk-source?" + KAFKA_PARAMS);
 
         // ── Loader 2: https-to-https ─────────────────────────────────────────────
-        from("timer:hh-load?period=200")
+        from("timer:hh-load?period=50")
             .routeId("load-https-to-https")
             .setBody(simple("hh-${date:now:yyyyMMdd-HHmmss.SSS}"))
             .setHeader("Content-Type", constant("text/plain"))
             .to(BRIDGE + "/ingest/hh?httpMethod=POST&bridgeEndpoint=true&throwExceptionOnFailure=false");
 
         // ── Loader 3: https-to-kafka ─────────────────────────────────────────────
-        from("timer:hk-load?period=200")
+        from("timer:hk-load?period=50")
             .routeId("load-https-to-kafka")
             .setBody(simple("hk-${date:now:yyyyMMdd-HHmmss.SSS}"))
             .setHeader("Content-Type", constant("text/plain"))

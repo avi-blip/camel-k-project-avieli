@@ -1,0 +1,28 @@
+# kafka-to-kafka: consume kk-source -> rate-limit -> produce kk-sink.
+# Blocking backpressure: the consumer waits for a token, nothing is dropped.
+#
+# ── Configure the rate limit here ──────────────────────────────────────────
+#   method: "block('<bucket>', <rate/s>, <burst>)"
+#   Currently: 10 msg/s sustained, burst 20.
+- route:
+    id: kafka-to-kafka
+    from:
+      uri: "kafka:kk-source"
+      parameters:
+        groupId: kk-bridge
+        autoOffsetReset: earliest
+        brokers: "kafka.kafka.svc.cluster.local:9092"
+        securityProtocol: SASL_PLAINTEXT
+        saslMechanism: SCRAM-SHA-256
+        saslJaasConfig: 'org.apache.kafka.common.security.scram.ScramLoginModule required username="{{kafka.user}}" password="{{kafka.password}}";'
+      steps:
+        - bean:
+            ref: rateLimit
+            method: "block('kk', 10.0, 20)"
+        - to:
+            uri: "kafka:kk-sink"
+            parameters:
+              brokers: "kafka.kafka.svc.cluster.local:9092"
+              securityProtocol: SASL_PLAINTEXT
+              saslMechanism: SCRAM-SHA-256
+              saslJaasConfig: 'org.apache.kafka.common.security.scram.ScramLoginModule required username="{{kafka.user}}" password="{{kafka.password}}";'

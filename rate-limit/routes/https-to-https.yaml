@@ -1,0 +1,31 @@
+# https-to-https: POST /ingest/hh -> rate-limit -> forward to echo-server -> 202.
+# Over-limit callers get 429 + Retry-After (the bean stops the route before forwarding).
+# Reachable on :8080 (HTTP) and :8443 (pod-terminated TLS); same route, both listeners.
+#
+# ── Configure the rate limit here ──────────────────────────────────────────
+#   method: "http('<bucket>', <rate/s>, <burst>)"
+#   Currently: 5 req/s sustained, burst 10.
+- route:
+    id: https-to-https
+    from:
+      uri: "platform-http:/ingest/hh"
+      steps:
+        - bean:
+            ref: rateLimit
+            method: "http(${exchange}, 'hh', 5.0, 10)"
+        - removeHeaders:
+            pattern: "Camel*"
+        - setHeader:
+            name: Content-Type
+            constant: "text/plain"
+        - to:
+            uri: "http:echo-server.camel-k.svc.cluster.local/echo"
+            parameters:
+              httpMethod: POST
+              bridgeEndpoint: true
+              throwExceptionOnFailure: false
+        - setHeader:
+            name: CamelHttpResponseCode
+            constant: "202"
+        - setBody:
+            constant: "forwarded\n"

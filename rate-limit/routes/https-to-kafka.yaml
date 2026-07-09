@@ -1,0 +1,26 @@
+# https-to-kafka: POST /ingest/hk -> rate-limit -> produce hk-sink -> 202.
+# Over-limit callers get 429 + Retry-After (the bean stops the route before producing).
+#
+# ── Configure the rate limit here ──────────────────────────────────────────
+#   method: "http('<bucket>', <rate/s>, <burst>)"
+#   Currently: 5 req/s sustained, burst 10.
+- route:
+    id: https-to-kafka
+    from:
+      uri: "platform-http:/ingest/hk"
+      steps:
+        - bean:
+            ref: rateLimit
+            method: "http(${exchange}, 'hk', 5.0, 10)"
+        - to:
+            uri: "kafka:hk-sink"
+            parameters:
+              brokers: "kafka.kafka.svc.cluster.local:9092"
+              securityProtocol: SASL_PLAINTEXT
+              saslMechanism: SCRAM-SHA-256
+              saslJaasConfig: 'org.apache.kafka.common.security.scram.ScramLoginModule required username="{{kafka.user}}" password="{{kafka.password}}";'
+        - setHeader:
+            name: CamelHttpResponseCode
+            constant: "202"
+        - setBody:
+            constant: "accepted\n"

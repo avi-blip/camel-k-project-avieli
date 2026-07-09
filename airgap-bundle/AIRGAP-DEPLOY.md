@@ -1,11 +1,11 @@
 # Air-Gapped Deployment Guide — Camel K + Kafka on RHEL / k3s
 
 Deploy Apache Camel K 2.10.1, a single-node Kafka, the `kafka-bridge` (Kafka→Kafka)
-integration, a 5-second test-data producer, and (optionally) the `rate-limited-bridge`
-integration — per-client rate limiting backed by Redis, for Kafka and HTTP/HTTPS
-sources (§8.1) — on an **air-gapped RHEL server (x86_64) that already runs a k3s
-cluster** (e.g. on Nutanix AHV), using only the artifacts in this bundle.
-**No internet access is required at any step.**
+integration, a 5-second test-data producer, and (optionally) the `multi-route-bridge`
+integration — distributed rate limiting backed by Redis, delivered as one reusable Java
+plugin plus per-route YAML files, for Kafka and HTTP/HTTPS sources (§8.1) — on an
+**air-gapped RHEL server (x86_64) that already runs a k3s cluster** (e.g. on Nutanix AHV),
+using only the artifacts in this bundle. **No internet access is required at any step.**
 
 Key design decision: Camel K normally downloads Maven artifacts from the internet to
 build integration images. This bundle ships the **complete Maven repository** (validated:
@@ -28,7 +28,7 @@ airgap-bundle/
 ├── cli/linux-amd64/
 │   └── kubectl (v1.36.2), helm (v4.2.2), kamel (2.10.1)   ← static ELF x86-64 binaries
 ├── maven/
-│   └── camel-k-m2.tgz              ← complete Maven repo (~4,200 files, 199 MB compressed; incl. jedis + platform-http)
+│   └── camel-k-m2.tgz              ← complete Maven repo (~4,346 files, 202 MB compressed; incl. jedis + platform-http + brotli4j native-linux-x86_64)
 └── manifests/
     ├── registry.yaml               ← in-cluster registry (NodePort 30500)
     ├── maven-mirror.yaml           ← nginx Maven mirror + settings.xml ConfigMap
@@ -36,8 +36,11 @@ airgap-bundle/
     ├── kafka-producer.yaml         ← produces a message to source-topic every 5 s (SCRAM-authenticated)
     ├── kafka-bridge.yaml           ← the Camel route (source-topic → sink-topic, SCRAM-authenticated)
     ├── redis.yaml                  ← Redis (ns redis) — shared state for distributed rate limiting
-    ├── RateLimitedRoutes.java      ← per-client rate-limited routes (Kafka + HTTP/HTTPS), Redis token bucket
-    └── ingress-https.yaml          ← TLS ingress (Traefik, built into k3s) exposing the HTTP route as HTTPS
+    ├── RateLimit.java              ← the rate-limit plugin: registers the `rateLimit` bean (Redis token bucket), no routes
+    ├── routes/*.yaml               ← rate-limited routes (kafka-to-kafka, https-to-https, https-to-kafka) — configure SLA inline
+    ├── echo-server.yaml            ← tiny nginx, downstream target of the https-to-https route
+    ├── MultiRouteLoaders.java      ← optional load generators (one timer per route) to drive traffic over the SLA
+    └── multi-route-nodeport.yaml   ← exposes the bridge HTTP (30081) + pod-TLS HTTPS (30444) listeners
 ```
 
 Versions: Camel K 2.10.1 (runtime catalog 3.15.3, Camel 4.8.5, Quarkus/JVM mode, Jib publish,
@@ -188,49 +191,70 @@ Multi-node note: `maven-mirror` and `registry` use hostPath volumes — pin them
 holding `/opt/maven-repo` and `/opt/registry-storage` with a nodeSelector, or put the data
 on shared storage (e.g. Nutanix Files/Volumes).
 
-## 8.1 Optional: per-client rate limiting (Redis token bucket — Kafka + HTTP/HTTPS)
+## 8.1 Optional: distributed rate limiting (Redis token bucket — plugin + YAML routes)
 
-`manifests/RateLimitedRoutes.java` runs one route per client, each with its own SLA
-enforced **globally across all pods**: the limiter is a token bucket evaluated as an
-atomic Lua script in Redis (using the Redis server clock), so scaling the integration
-up/down never changes a client's aggregate rate. Kafka routes *block* when over-limit
-(backpressure, nothing dropped); the HTTP/HTTPS route rejects with `429 + Retry-After`.
-Default clients (edit rates in the source): `client-a` Kafka 5 msg/s, `client-b` Kafka
-2 msg/s, `client-c` HTTP `/ingest/client-c` 3 req/s.
+Rate limiting is packaged as **one reusable Java plugin plus per-route YAML files**:
+
+- `manifests/RateLimit.java` is a RouteBuilder that defines **no routes** — it only
+  registers the `rateLimit` bean, a token bucket evaluated as an atomic Lua script in
+  Redis (using the Redis server clock). The SLA is enforced **globally across all pods**,
+  so scaling the integration up/down never changes the aggregate rate.
+- `manifests/routes/*.yaml` are the routes. Each calls the bean and configures its own
+  key/rate/burst inline. Kafka routes *block* when over-limit (backpressure, nothing
+  dropped) via `block('<key>', <rate>, <burst>)`; HTTP/HTTPS routes reject with
+  `429 + Retry-After` via `http(${exchange}, '<key>', <rate>, <burst>)`.
+
+Routes shipped: `kafka-to-kafka` (`kk-source`→`kk-sink`, 10 msg/s), `https-to-https`
+(`/ingest/hh`→echo-server, 5 req/s), `https-to-kafka` (`/ingest/hk`→`hk-sink`, 5 req/s).
+Add a route by dropping another YAML in `manifests/routes/` — no Java change.
 
 ```bash
 kubectl apply -f manifests/redis.yaml
 kubectl rollout status deployment/redis -n redis --timeout=180s
+kubectl apply -f manifests/echo-server.yaml          # downstream for https-to-https
 
-# Per-client topics: 3 partitions on sources so multiple pods can share consumption
+# Topics the routes use
 POD=$(kubectl get pod -n kafka -l app=kafka -o jsonpath='{.items[0].metadata.name}')
-for t in client-a-topic:3 client-b-topic:3 client-a-sink:1 client-b-sink:1 client-c-sink:1; do
+for t in kk-source:1 kk-sink:1 hk-sink:1; do
   kubectl exec -n kafka $POD -- /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9094 \
     --create --if-not-exists --topic ${t%%:*} --partitions ${t##*:} --replication-factor 1
 done
 
-# Requires the kafka-scram-credentials Secret in camel-k (already copied in §8)
-kamel run manifests/RateLimitedRoutes.java -n camel-k --name rate-limited-bridge \
-  --config secret:kafka-scram-credentials -d mvn:redis.clients:jedis:5.2.0
-kubectl wait integration/rate-limited-bridge -n camel-k --for=condition=Ready --timeout=600s
-
-# HTTPS: TLS-terminating ingress via the Traefik that ships with k3s
+# Pod-terminated TLS cert for the HTTPS (8443) listener
 openssl req -x509 -newkey rsa:2048 -keyout tls.key -out tls.crt -days 365 -nodes \
   -subj "/CN=ratelimit.local" -addext "subjectAltName=DNS:ratelimit.local"
 kubectl create secret tls ratelimit-tls -n camel-k --cert=tls.crt --key=tls.key
-kubectl apply -f manifests/ingress-https.yaml
+
+# Requires the kafka-scram-credentials Secret in camel-k (already copied in §8).
+# One plugin + every route in routes/:
+kamel run manifests/RateLimit.java manifests/routes/*.yaml \
+  -n camel-k --name multi-route-bridge \
+  --config secret:kafka-scram-credentials \
+  -d mvn:redis.clients:jedis:5.2.0 -d camel:http \
+  --resource secret:ratelimit-tls@/etc/tls \
+  -p quarkus.http.ssl-port=8443 \
+  -p quarkus.http.ssl.certificate.files=/etc/tls/tls.crt \
+  -p quarkus.http.ssl.certificate.key-files=/etc/tls/tls.key
+kubectl wait integration/multi-route-bridge -n camel-k --for=condition=Ready --timeout=600s
+
+kubectl apply -f manifests/multi-route-nodeport.yaml   # external HTTP 30081 / HTTPS 30444
+
+# Optional: load generators that drive all three routes well over their SLA
+kamel run manifests/MultiRouteLoaders.java -n camel-k --name multi-route-loaders \
+  --config secret:kafka-scram-credentials -d camel:http
 ```
 
-Scale with `kubectl scale integration rate-limited-bridge -n camel-k --replicas=2` —
-**not** `kubectl scale deployment`, which the operator immediately reverts. The per-client
-rate stays at the configured SLA regardless of replica count (verified: identical
-aggregate throughput at 1 and 2 pods).
+Scale with `kubectl scale integration multi-route-bridge -n camel-k --replicas=2` —
+**not** `kubectl scale deployment`, which the operator immediately reverts. The rate stays
+at the configured SLA regardless of replica count (verified: identical aggregate
+throughput at 1 and 2 pods).
 
 Quick checks: HTTP from inside the cluster answers `202` until the bucket empties, then
-`429` (`curl http://rate-limited-bridge.camel-k/ingest/client-c`); HTTPS via the ingress
-(`curl -k --resolve ratelimit.local:443:<NODE_IP> https://ratelimit.local/ingest/client-c`).
-All Maven artifacts for this integration (`redis.clients:jedis` + camel-quarkus-platform-http)
-are included in the bundled Maven repo.
+`429` (`curl -X POST -H 'Content-Type: text/plain' --data t http://multi-route-bridge.camel-k/ingest/hh`);
+externally via NodePort `http://<NODE_IP>:30081/ingest/hh` or pod-TLS
+`https://<NODE_IP>:30444/ingest/hh` (`-k`). All Maven artifacts for these routes
+(`redis.clients:jedis`, camel-quarkus-platform-http, camel:http) and the `nginx:1.27-alpine`
+echo-server image are already in the bundle.
 
 ## 9. End-to-end verification
 
@@ -260,7 +284,7 @@ kamel logs kafka-bridge -n camel-k    # "Bridging message: auto-msg-N ..."
 | Capability | Offline? |
 |---|---|
 | Running + rebuilding `kafka-bridge` | ✅ fully validated (cold build, 2,812 artifacts from mirror) |
-| Running + rebuilding `rate-limited-bridge` (kafka + platform-http + jedis) | ✅ artifacts included in the bundled repo |
+| Running + rebuilding `multi-route-bridge` (RateLimit.java plugin + YAML routes: kafka + platform-http + jedis + http) | ✅ artifacts included in the bundled repo |
 | New integrations using camel:kafka / camel:platform-http / log / yaml-dsl / java | ✅ same dependency set |
 | New integrations with **other** camel components (e.g. camel:sql) | ⚠️ only after adding their artifacts to the mirror (see below) |
 | Native/Quarkus-native builds | ❌ not bundled |
@@ -270,12 +294,33 @@ on the generated project) with the same runtime version (3.15.3), grab the addit
 artifacts from its local repo, and drop them into `/opt/maven-repo/m2` (same layout).
 No restart needed — nginx serves them immediately.
 
+**Cross-architecture gotcha:** if the build machine is Apple Silicon (aarch64), Maven only
+downloads `*-linux-aarch64` native JARs (e.g. `brotli4j/native-linux-aarch64`). The RHEL
+x86_64 target needs `*-linux-x86_64` variants. After any mirror population from an ARM
+machine, audit for architecture-specific artifacts and fetch the x86_64 twins explicitly:
+
+```bash
+# Find aarch64-only artifacts in the mirror and list their x86_64 counterparts
+find /opt/maven-repo/m2 -type d -name "*aarch64*" | sed 's/aarch64/x86_64/g'
+
+# Example: fetch brotli4j native-linux-x86_64 for a given version V
+V=1.16.0
+BASE=https://repo1.maven.org/maven2/com/aayushatharva/brotli4j/native-linux-x86_64/$V
+DEST=/opt/maven-repo/m2/com/aayushatharva/brotli4j/native-linux-x86_64/$V
+mkdir -p $DEST
+for f in native-linux-x86_64-$V.jar native-linux-x86_64-$V.jar.sha1 \
+          native-linux-x86_64-$V.pom native-linux-x86_64-$V.pom.sha1; do
+  curl -fsSL $BASE/$f -o $DEST/$f
+done
+```
+
 ## 11. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
 | Pod `ImagePullBackOff` | Image not imported: `sudo k3s ctr images import images/all-images-amd64.tar`; verify with `sudo k3s crictl images` |
 | Build fails downloading artifacts | `kubectl logs -n camel-k deployment/maven-mirror` — 404s on `.jar`/`.pom` files mean a missing artifact (§10). 404s on `maven-metadata.xml` only are normal. |
+| Build fails with `could not resolve ... native-linux-x86_64` (or similar platform artifact) | The mirror was populated from an Apple Silicon / aarch64 build; Maven only downloaded the aarch64 native JARs. Download the missing x86_64 artifact from Maven Central, drop it under `/opt/maven-repo/m2/<group-path>/<version>/` with matching `.pom` and `.sha1` files, then retry — no mirror restart needed. |
 | Build fails pushing image | Registry address/insecure flag: `kubectl get ip camel-k -n camel-k -o yaml \| grep -A3 registry`; must be `<NODE_IP>:30500`, `insecure: true`, and `registries.yaml` in place (k3s restarted) |
 | Build fails pulling base image (docker.io/eclipse-temurin timeout) | `spec.build.baseImage` patch missing (§6) or the image wasn't pushed to the registry (§4.1) |
 | Integration pod `ErrImagePull` from `<NODE_IP>:30500` | `/etc/rancher/k3s/registries.yaml` missing/typo → kubelet tries HTTPS. Fix and `sudo systemctl restart k3s` |
