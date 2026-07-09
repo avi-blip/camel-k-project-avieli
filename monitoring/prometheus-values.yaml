@@ -10,8 +10,15 @@ server:
   persistentVolume:
     enabled: false
   retention: 7d
+  global:
+    scrape_interval: 15s
+    evaluation_interval: 15s
 extraScrapeConfigs: |
+  # Auto-discovers every Camel K integration pod in the camel-k namespace.
+  # Works with: kamel run MyRoute.java -t prometheus.enabled=true -t prometheus.pod-monitor=false
+  # Each pod exposes /q/metrics on port 8080 (plain HTTP). No Prometheus Operator needed.
   - job_name: camel-k-integrations
+    scrape_interval: 10s
     metrics_path: /q/metrics
     kubernetes_sd_configs:
       - role: pod
@@ -19,15 +26,26 @@ extraScrapeConfigs: |
           names:
             - camel-k
     relabel_configs:
+      # Keep only pods that belong to a Camel K integration
       - source_labels: [__meta_kubernetes_pod_label_camel_apache_org_integration]
         action: keep
         regex: .+
+      # Only scrape Running pods
+      - source_labels: [__meta_kubernetes_pod_phase]
+        action: keep
+        regex: Running
+      # Scrape the pod IP on port 8080
       - source_labels: [__meta_kubernetes_pod_ip]
         target_label: __address__
         replacement: $1:8080
+      # Expose integration name, namespace, and pod as labels on every metric
       - source_labels: [__meta_kubernetes_pod_label_camel_apache_org_integration]
         target_label: integration
       - source_labels: [__meta_kubernetes_namespace]
         target_label: namespace
       - source_labels: [__meta_kubernetes_pod_name]
         target_label: pod
+      # Carry through any extra labels the operator stamps on the pod
+      - regex: __meta_kubernetes_pod_label_camel_apache_org_(.+)
+        action: labelmap
+        replacement: camel_$1

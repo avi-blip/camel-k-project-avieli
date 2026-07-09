@@ -1,0 +1,22 @@
+# NodePort service exposing multi-route-bridge's HTTP (8080→30081) and HTTPS (8443→30444) ports.
+# TLS on 30444 terminates inside the pod (Quarkus, ratelimit-tls secret) — no ingress involved.
+apiVersion: v1
+kind: Service
+metadata:
+  name: multi-route-bridge-nodeports
+  namespace: camel-k
+  labels:
+    camel.apache.org/integration: multi-route-bridge
+spec:
+  type: NodePort
+  selector:
+    camel.apache.org/integration: multi-route-bridge
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      nodePort: 30081
+    - name: https
+      port: 8443
+      targetPort: 8443
+      nodePort: 30444

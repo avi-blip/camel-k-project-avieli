@@ -1,5 +1,7 @@
 adminUser: admin
 adminPassword: camelk
+image:
+  tag: "11.6.9"
 persistence:
   enabled: false
 datasources:
@@ -31,88 +33,544 @@ dashboardProviders:
           path: /var/lib/grafana/dashboards/default
 dashboards:
   default:
-    camel-route:
+    camel-k-routes:
       json: |
         {
-          "title": "Camel K - Kafka Bridge",
-          "uid": "camel-kafka-bridge",
+          "title": "Camel K – Route Metrics",
+          "uid": "camel-k-routes",
+          "description": "Per-integration, per-route RPS, latency, rate-limiting and JVM health. Use the dropdowns to filter.",
           "timezone": "browser",
           "refresh": "10s",
           "time": { "from": "now-30m", "to": "now" },
+          "schemaVersion": 39,
+          "version": 1,
+          "templating": {
+            "list": [
+              {
+                "name": "integration",
+                "label": "Integration",
+                "type": "query",
+                "datasource": { "type": "prometheus", "uid": "prometheus" },
+                "query": "label_values(camel_exchanges_total, integration)",
+                "definition": "label_values(camel_exchanges_total, integration)",
+                "refresh": 2,
+                "sort": 1,
+                "includeAll": true,
+                "allValue": ".+",
+                "multi": false,
+                "current": {}
+              },
+              {
+                "name": "routeId",
+                "label": "Route",
+                "type": "query",
+                "datasource": { "type": "prometheus", "uid": "prometheus" },
+                "query": "label_values(camel_exchanges_total{integration=~\"$integration\"}, routeId)",
+                "definition": "label_values(camel_exchanges_total{integration=~\"$integration\"}, routeId)",
+                "refresh": 2,
+                "sort": 1,
+                "includeAll": true,
+                "allValue": ".+",
+                "multi": true,
+                "current": {}
+              }
+            ]
+          },
           "panels": [
             {
               "id": 1,
               "type": "stat",
-              "title": "Exchanges total (all routes)",
-              "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+              "title": "Total RPS",
+              "description": "Exchanges per second across all selected routes (1 m rate)",
+              "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
               "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "reqps",
+                  "color": { "mode": "thresholds" },
+                  "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+                }
+              },
+              "options": {
+                "reduceOptions": { "calcs": ["lastNotNull"] },
+                "orientation": "auto",
+                "textMode": "auto",
+                "colorMode": "background"
+              },
               "targets": [
-                { "expr": "sum(camel_exchanges_total{integration=\"kafka-bridge\"})", "refId": "A" }
+                {
+                  "expr": "sum(rate(camel_exchanges_total{integration=~\"$integration\", routeId=~\"$routeId\"}[1m]))",
+                  "refId": "A"
+                }
               ]
             },
             {
               "id": 2,
               "type": "stat",
-              "title": "Exchanges failed",
-              "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+              "title": "P99 Processing Latency",
+              "description": "99th-percentile Camel exchange processing time (5 m window)",
+              "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
               "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "s",
+                  "color": { "mode": "thresholds" },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      { "color": "green", "value": null },
+                      { "color": "yellow", "value": 0.5 },
+                      { "color": "red", "value": 2 }
+                    ]
+                  }
+                }
+              },
+              "options": {
+                "reduceOptions": { "calcs": ["lastNotNull"] },
+                "colorMode": "background"
+              },
               "targets": [
-                { "expr": "sum(camel_exchanges_failed_total{integration=\"kafka-bridge\"})", "refId": "A" }
+                {
+                  "expr": "histogram_quantile(0.99, sum by (le) (rate(camel_exchange_processing_seconds_bucket{integration=~\"$integration\", routeId=~\"$routeId\"}[5m])))",
+                  "refId": "A"
+                }
               ]
             },
             {
               "id": 3,
-              "type": "timeseries",
-              "title": "Message rate through route (msg/s)",
-              "gridPos": { "h": 6, "w": 12, "x": 12, "y": 0 },
+              "type": "stat",
+              "title": "Success Rate",
+              "description": "Fraction of exchanges that did NOT fail",
+              "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
               "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "percentunit",
+                  "color": { "mode": "thresholds" },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      { "color": "red", "value": null },
+                      { "color": "yellow", "value": 0.9 },
+                      { "color": "green", "value": 0.99 }
+                    ]
+                  }
+                }
+              },
+              "options": {
+                "reduceOptions": { "calcs": ["lastNotNull"] },
+                "colorMode": "background"
+              },
               "targets": [
-                { "expr": "sum by (routeId) (rate(camel_exchanges_total{integration=\"kafka-bridge\"}[1m]))", "legendFormat": "{{routeId}}", "refId": "A" }
+                {
+                  "expr": "1 - sum(rate(camel_exchanges_failed_total{integration=~\"$integration\", routeId=~\"$routeId\"}[1m])) / sum(rate(camel_exchanges_total{integration=~\"$integration\", routeId=~\"$routeId\"}[1m]))",
+                  "refId": "A"
+                }
               ]
             },
             {
               "id": 4,
-              "type": "timeseries",
-              "title": "Exchange processing time (mean, seconds)",
-              "gridPos": { "h": 6, "w": 12, "x": 0, "y": 6 },
+              "type": "stat",
+              "title": "Rate-Limited (429/s)",
+              "description": "HTTP 429 responses per second — i.e., requests dropped by the token bucket",
+              "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
               "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "reqps",
+                  "color": { "mode": "thresholds" },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      { "color": "green", "value": null },
+                      { "color": "orange", "value": 0.1 },
+                      { "color": "red", "value": 1 }
+                    ]
+                  }
+                }
+              },
+              "options": {
+                "reduceOptions": { "calcs": ["lastNotNull"] },
+                "colorMode": "background"
+              },
               "targets": [
-                { "expr": "sum by (routeId) (rate(camel_exchange_processing_seconds_sum{integration=\"kafka-bridge\"}[5m])) / sum by (routeId) (rate(camel_exchange_processing_seconds_count{integration=\"kafka-bridge\"}[5m]))", "legendFormat": "{{routeId}}", "refId": "A" }
+                {
+                  "expr": "sum(rate(http_server_requests_seconds_count{integration=~\"$integration\", status=\"429\"}[1m]))",
+                  "refId": "A"
+                }
               ]
             },
             {
               "id": 5,
-              "type": "timeseries",
-              "title": "JVM heap used",
-              "gridPos": { "h": 6, "w": 12, "x": 12, "y": 6 },
+              "type": "stat",
+              "title": "Failed Exchanges",
+              "description": "Cumulative failed exchange count since last restart",
+              "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
               "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "short",
+                  "color": { "mode": "thresholds" },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      { "color": "green", "value": null },
+                      { "color": "red", "value": 1 }
+                    ]
+                  }
+                }
+              },
+              "options": {
+                "reduceOptions": { "calcs": ["lastNotNull"] },
+                "colorMode": "background"
+              },
               "targets": [
-                { "expr": "sum(jvm_memory_used_bytes{integration=\"kafka-bridge\", area=\"heap\"})", "legendFormat": "heap used", "refId": "A" }
+                {
+                  "expr": "sum(camel_exchanges_failed_total{integration=~\"$integration\", routeId=~\"$routeId\"})",
+                  "refId": "A"
+                }
               ]
             },
             {
               "id": 6,
-              "type": "logs",
-              "title": "Integration logs (messages through the route)",
-              "gridPos": { "h": 10, "w": 24, "x": 0, "y": 12 },
-              "datasource": { "type": "loki", "uid": "loki" },
-              "options": { "showTime": true, "wrapLogMessage": true, "sortOrder": "Descending" },
+              "type": "stat",
+              "title": "Active Routes",
+              "description": "Number of distinct routeId values currently emitting metrics",
+              "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "short",
+                  "color": { "mode": "thresholds" },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [{ "color": "blue", "value": null }]
+                  }
+                }
+              },
+              "options": {
+                "reduceOptions": { "calcs": ["lastNotNull"] },
+                "colorMode": "background"
+              },
               "targets": [
-                { "expr": "{namespace=\"camel-k\", pod=~\"kafka-bridge.*\"}", "refId": "A" }
+                {
+                  "expr": "count(count by (routeId) (camel_exchanges_total{integration=~\"$integration\"}))",
+                  "refId": "A"
+                }
               ]
             },
             {
               "id": 7,
-              "type": "logs",
-              "title": "Bridged messages only",
-              "gridPos": { "h": 8, "w": 24, "x": 0, "y": 22 },
-              "datasource": { "type": "loki", "uid": "loki" },
-              "options": { "showTime": true, "wrapLogMessage": true, "sortOrder": "Descending" },
+              "type": "timeseries",
+              "title": "RPS by Route",
+              "description": "Per-route exchange throughput (1 m rate). Use the Route dropdown to isolate.",
+              "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "reqps",
+                  "custom": { "lineWidth": 2, "fillOpacity": 10 }
+                }
+              },
+              "options": {
+                "tooltip": { "mode": "multi", "sort": "desc" },
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "calcs": ["mean", "max", "lastNotNull"]
+                }
+              },
               "targets": [
-                { "expr": "{namespace=\"camel-k\", pod=~\"kafka-bridge.*\"} |= \"Bridging message\"", "refId": "A" }
+                {
+                  "expr": "sum by (routeId) (rate(camel_exchanges_total{integration=~\"$integration\", routeId=~\"$routeId\"}[1m]))",
+                  "legendFormat": "{{routeId}}",
+                  "refId": "A"
+                }
+              ]
+            },
+            {
+              "id": 8,
+              "type": "timeseries",
+              "title": "Exchange Rate: Success vs Failed",
+              "description": "Green = successful exchanges/s, red = failed exchanges/s, per route.",
+              "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "reqps",
+                  "custom": { "lineWidth": 2 }
+                }
+              },
+              "options": {
+                "tooltip": { "mode": "multi", "sort": "desc" },
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "calcs": ["mean", "lastNotNull"]
+                }
+              },
+              "targets": [
+                {
+                  "expr": "sum by (routeId) (rate(camel_exchanges_total{integration=~\"$integration\", routeId=~\"$routeId\"}[1m])) - sum by (routeId) (rate(camel_exchanges_failed_total{integration=~\"$integration\", routeId=~\"$routeId\"}[1m]))",
+                  "legendFormat": "ok / {{routeId}}",
+                  "refId": "A"
+                },
+                {
+                  "expr": "sum by (routeId) (rate(camel_exchanges_failed_total{integration=~\"$integration\", routeId=~\"$routeId\"}[1m]))",
+                  "legendFormat": "failed / {{routeId}}",
+                  "refId": "B"
+                }
+              ]
+            },
+            {
+              "id": 9,
+              "type": "timeseries",
+              "title": "Exchange Processing Latency – P50 / P95 / P99",
+              "description": "Camel exchange duration histogram quantiles. P99 spike = a slow processor or backpressure.",
+              "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "s",
+                  "custom": { "lineWidth": 2 }
+                }
+              },
+              "options": {
+                "tooltip": { "mode": "multi", "sort": "desc" },
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "calcs": ["mean", "max", "lastNotNull"]
+                }
+              },
+              "targets": [
+                {
+                  "expr": "histogram_quantile(0.50, sum by (le, routeId) (rate(camel_exchange_processing_seconds_bucket{integration=~\"$integration\", routeId=~\"$routeId\"}[5m])))",
+                  "legendFormat": "P50 {{routeId}}",
+                  "refId": "A"
+                },
+                {
+                  "expr": "histogram_quantile(0.95, sum by (le, routeId) (rate(camel_exchange_processing_seconds_bucket{integration=~\"$integration\", routeId=~\"$routeId\"}[5m])))",
+                  "legendFormat": "P95 {{routeId}}",
+                  "refId": "B"
+                },
+                {
+                  "expr": "histogram_quantile(0.99, sum by (le, routeId) (rate(camel_exchange_processing_seconds_bucket{integration=~\"$integration\", routeId=~\"$routeId\"}[5m])))",
+                  "legendFormat": "P99 {{routeId}}",
+                  "refId": "C"
+                }
+              ]
+            },
+            {
+              "id": 10,
+              "type": "timeseries",
+              "title": "HTTP Request Latency by URI – P50 / P95 / P99",
+              "description": "Quarkus HTTP server duration histogram for the /ingest/* endpoints.",
+              "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "s",
+                  "custom": { "lineWidth": 2 }
+                }
+              },
+              "options": {
+                "tooltip": { "mode": "multi", "sort": "desc" },
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "calcs": ["mean", "max", "lastNotNull"]
+                }
+              },
+              "targets": [
+                {
+                  "expr": "histogram_quantile(0.50, sum by (le, uri) (rate(http_server_requests_seconds_bucket{integration=~\"$integration\"}[5m])))",
+                  "legendFormat": "P50 {{uri}}",
+                  "refId": "A"
+                },
+                {
+                  "expr": "histogram_quantile(0.95, sum by (le, uri) (rate(http_server_requests_seconds_bucket{integration=~\"$integration\"}[5m])))",
+                  "legendFormat": "P95 {{uri}}",
+                  "refId": "B"
+                },
+                {
+                  "expr": "histogram_quantile(0.99, sum by (le, uri) (rate(http_server_requests_seconds_bucket{integration=~\"$integration\"}[5m])))",
+                  "legendFormat": "P99 {{uri}}",
+                  "refId": "C"
+                }
+              ]
+            },
+            {
+              "id": 11,
+              "type": "timeseries",
+              "title": "HTTP Responses: 202 Accepted vs 429 Rate-Limited",
+              "description": "Shows the split between accepted and throttled requests per ingest path.",
+              "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "reqps",
+                  "custom": { "lineWidth": 2, "fillOpacity": 8 }
+                }
+              },
+              "options": {
+                "tooltip": { "mode": "multi", "sort": "desc" },
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "calcs": ["mean", "lastNotNull"]
+                }
+              },
+              "targets": [
+                {
+                  "expr": "sum by (status, uri) (rate(http_server_requests_seconds_count{integration=~\"$integration\", status=~\"202|429\"}[1m]))",
+                  "legendFormat": "{{status}} {{uri}}",
+                  "refId": "A"
+                }
+              ]
+            },
+            {
+              "id": 12,
+              "type": "timeseries",
+              "title": "Rate-Limit Rejection Ratio per Path",
+              "description": "429s / total requests per URI. Approaching 1 means the client is consistently over SLA.",
+              "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "percentunit",
+                  "min": 0,
+                  "max": 1,
+                  "custom": { "lineWidth": 2 }
+                }
+              },
+              "options": {
+                "tooltip": { "mode": "multi", "sort": "desc" },
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "calcs": ["mean", "max", "lastNotNull"]
+                }
+              },
+              "targets": [
+                {
+                  "expr": "sum by (uri) (rate(http_server_requests_seconds_count{integration=~\"$integration\", status=\"429\"}[1m])) / sum by (uri) (rate(http_server_requests_seconds_count{integration=~\"$integration\"}[1m]))",
+                  "legendFormat": "{{uri}}",
+                  "refId": "A"
+                }
+              ]
+            },
+            {
+              "id": 13,
+              "type": "timeseries",
+              "title": "JVM Heap Used vs Max",
+              "gridPos": { "h": 6, "w": 8, "x": 0, "y": 28 },
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "bytes",
+                  "custom": { "lineWidth": 2 }
+                }
+              },
+              "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"] } },
+              "targets": [
+                {
+                  "expr": "sum by (pod) (jvm_memory_used_bytes{integration=~\"$integration\", area=\"heap\"})",
+                  "legendFormat": "used – {{pod}}",
+                  "refId": "A"
+                },
+                {
+                  "expr": "sum by (pod) (jvm_memory_max_bytes{integration=~\"$integration\", area=\"heap\"})",
+                  "legendFormat": "max – {{pod}}",
+                  "refId": "B"
+                }
+              ]
+            },
+            {
+              "id": 14,
+              "type": "timeseries",
+              "title": "CPU Usage",
+              "gridPos": { "h": 6, "w": 8, "x": 8, "y": 28 },
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "percentunit",
+                  "min": 0,
+                  "max": 1,
+                  "custom": { "lineWidth": 2 }
+                }
+              },
+              "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "lastNotNull"] } },
+              "targets": [
+                {
+                  "expr": "process_cpu_usage{integration=~\"$integration\"}",
+                  "legendFormat": "process – {{pod}}",
+                  "refId": "A"
+                },
+                {
+                  "expr": "system_cpu_usage{integration=~\"$integration\"}",
+                  "legendFormat": "system – {{pod}}",
+                  "refId": "B"
+                }
+              ]
+            },
+            {
+              "id": 15,
+              "type": "timeseries",
+              "title": "JVM Threads by State",
+              "gridPos": { "h": 6, "w": 8, "x": 16, "y": 28 },
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "short",
+                  "custom": { "lineWidth": 2 }
+                }
+              },
+              "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"] } },
+              "targets": [
+                {
+                  "expr": "sum by (state) (jvm_threads_states_threads{integration=~\"$integration\"})",
+                  "legendFormat": "{{state}}",
+                  "refId": "A"
+                }
+              ]
+            },
+            {
+              "id": 16,
+              "type": "logs",
+              "title": "Integration Logs",
+              "gridPos": { "h": 8, "w": 24, "x": 0, "y": 34 },
+              "datasource": { "type": "loki", "uid": "loki" },
+              "options": {
+                "showTime": true,
+                "wrapLogMessage": true,
+                "sortOrder": "Descending",
+                "dedupStrategy": "none"
+              },
+              "targets": [
+                {
+                  "expr": "{namespace=\"camel-k\", pod=~\"$integration.*\"}",
+                  "refId": "A"
+                }
+              ]
+            },
+            {
+              "id": 17,
+              "type": "logs",
+              "title": "Rate Limit Denials",
+              "gridPos": { "h": 6, "w": 24, "x": 0, "y": 42 },
+              "datasource": { "type": "loki", "uid": "loki" },
+              "options": {
+                "showTime": true,
+                "wrapLogMessage": true,
+                "sortOrder": "Descending"
+              },
+              "targets": [
+                {
+                  "expr": "{namespace=\"camel-k\", pod=~\"$integration.*\"} |= \"rate limit exceeded\"",
+                  "refId": "A"
+                }
               ]
             }
-          ],
-          "schemaVersion": 39,
-          "version": 1
+          ]
         }
