@@ -16,7 +16,15 @@ for a RHEL x86_64 server running k3s (Nutanix).
 
 ## Large artifacts NOT in git (GitHub 100 MB limit)
 
-Regenerate on any online machine:
+**Download ready-made:** the complete transfer bundle (`camel-k-airgap-bundle.zip`, ~1 GB —
+images, Maven repo, CLIs, charts, manifests, guide) is attached to the
+[v1.0.0 release](https://github.com/avi-blip/camel-k-project-avieli/releases/tag/v1.0.0):
+
+```bash
+gh release download v1.0.0 --repo avi-blip/camel-k-project-avieli
+```
+
+Or regenerate on any online machine:
 
 ```bash
 # Container images (linux/amd64), ~700 MB
