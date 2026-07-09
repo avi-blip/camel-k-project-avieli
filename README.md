@@ -49,11 +49,11 @@ design rationale: `rate-limit/README.md`; offline deployment: §8.1 of the air-g
 ## Large artifacts NOT in git (GitHub 100 MB limit)
 
 **Download ready-made:** the complete transfer bundle (`camel-k-airgap-bundle.zip`, ~1 GB —
-images, Maven repo, CLIs, charts, manifests, guide) is attached to the
-[v1.0.0 release](https://github.com/avi-blip/camel-k-project-avieli/releases/tag/v1.0.0):
+images incl. Redis, Maven repo incl. jedis/platform-http, CLIs, charts, manifests, guide) is
+attached to the [v1.1.0 release](https://github.com/avi-blip/camel-k-project-avieli/releases/tag/v1.1.0):
 
 ```bash
-gh release download v1.0.0 --repo avi-blip/camel-k-project-avieli
+gh release download v1.1.0 --repo avi-blip/camel-k-project-avieli
 ```
 
 Or regenerate on any online machine:
