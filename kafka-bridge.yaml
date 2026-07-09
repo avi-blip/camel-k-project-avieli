@@ -1,0 +1,12 @@
+- from:
+    uri: "kafka:source-topic"
+    parameters:
+      brokers: "kafka.kafka.svc.cluster.local:9092"
+      groupId: "camel-bridge"
+      autoOffsetReset: "earliest"
+    steps:
+      - log: "Bridging message: ${body}"
+      - to:
+          uri: "kafka:sink-topic"
+          parameters:
+            brokers: "kafka.kafka.svc.cluster.local:9092"

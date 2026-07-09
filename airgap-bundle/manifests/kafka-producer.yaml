@@ -1,0 +1,38 @@
+# Test-data generator: produces one timestamped message to source-topic every 5 seconds.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-producer
+  namespace: kafka
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka-producer
+  template:
+    metadata:
+      labels:
+        app: kafka-producer
+    spec:
+      containers:
+        - name: producer
+          image: apache/kafka:3.9.1
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              i=0
+              while true; do
+                i=$((i+1))
+                msg="auto-msg-$i $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                echo "$msg" | /opt/kafka/bin/kafka-console-producer.sh \
+                  --bootstrap-server kafka.kafka.svc.cluster.local:9092 \
+                  --topic source-topic
+                echo "produced: $msg"
+                sleep 5
+              done
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 50m
+            limits:
+              memory: 512Mi

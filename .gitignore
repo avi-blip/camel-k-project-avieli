@@ -1,0 +1,7 @@
+.DS_Store
+
+# Large artifacts excluded from git (GitHub 100 MB limit) — see README for how to regenerate
+camel-k-airgap-bundle.zip
+airgap-bundle/images/all-images-amd64.tar
+airgap-bundle/maven/camel-k-m2.tgz
+airgap-bundle/cli/linux-amd64/

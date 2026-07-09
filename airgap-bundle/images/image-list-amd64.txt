@@ -1,0 +1,5 @@
+docker.io/apache/camel-k:2.10.1
+docker.io/apache/kafka:3.9.1
+docker.io/library/registry:2
+docker.io/library/eclipse-temurin:17-jdk
+docker.io/library/nginx:1.27-alpine

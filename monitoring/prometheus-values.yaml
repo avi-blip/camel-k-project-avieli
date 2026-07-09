@@ -1,0 +1,33 @@
+alertmanager:
+  enabled: false
+prometheus-node-exporter:
+  enabled: false
+prometheus-pushgateway:
+  enabled: false
+kube-state-metrics:
+  enabled: false
+server:
+  persistentVolume:
+    enabled: false
+  retention: 7d
+extraScrapeConfigs: |
+  - job_name: camel-k-integrations
+    metrics_path: /q/metrics
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - camel-k
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_camel_apache_org_integration]
+        action: keep
+        regex: .+
+      - source_labels: [__meta_kubernetes_pod_ip]
+        target_label: __address__
+        replacement: $1:8080
+      - source_labels: [__meta_kubernetes_pod_label_camel_apache_org_integration]
+        target_label: integration
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod

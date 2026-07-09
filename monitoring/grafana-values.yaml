@@ -1,0 +1,118 @@
+adminUser: admin
+adminPassword: camelk
+persistence:
+  enabled: false
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        uid: prometheus
+        type: prometheus
+        url: http://prometheus-server.monitoring.svc.cluster.local
+        access: proxy
+        isDefault: true
+      - name: Loki
+        uid: loki
+        type: loki
+        url: http://loki.monitoring.svc.cluster.local:3100
+        access: proxy
+dashboardProviders:
+  dashboardproviders.yaml:
+    apiVersion: 1
+    providers:
+      - name: default
+        orgId: 1
+        folder: ""
+        type: file
+        disableDeletion: false
+        editable: true
+        options:
+          path: /var/lib/grafana/dashboards/default
+dashboards:
+  default:
+    camel-route:
+      json: |
+        {
+          "title": "Camel K - Kafka Bridge",
+          "uid": "camel-kafka-bridge",
+          "timezone": "browser",
+          "refresh": "10s",
+          "time": { "from": "now-30m", "to": "now" },
+          "panels": [
+            {
+              "id": 1,
+              "type": "stat",
+              "title": "Exchanges total (all routes)",
+              "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "targets": [
+                { "expr": "sum(camel_exchanges_total{integration=\"kafka-bridge\"})", "refId": "A" }
+              ]
+            },
+            {
+              "id": 2,
+              "type": "stat",
+              "title": "Exchanges failed",
+              "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "targets": [
+                { "expr": "sum(camel_exchanges_failed_total{integration=\"kafka-bridge\"})", "refId": "A" }
+              ]
+            },
+            {
+              "id": 3,
+              "type": "timeseries",
+              "title": "Message rate through route (msg/s)",
+              "gridPos": { "h": 6, "w": 12, "x": 12, "y": 0 },
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "targets": [
+                { "expr": "sum by (routeId) (rate(camel_exchanges_total{integration=\"kafka-bridge\"}[1m]))", "legendFormat": "{{routeId}}", "refId": "A" }
+              ]
+            },
+            {
+              "id": 4,
+              "type": "timeseries",
+              "title": "Exchange processing time (mean, seconds)",
+              "gridPos": { "h": 6, "w": 12, "x": 0, "y": 6 },
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "targets": [
+                { "expr": "sum by (routeId) (rate(camel_exchange_processing_seconds_sum{integration=\"kafka-bridge\"}[5m])) / sum by (routeId) (rate(camel_exchange_processing_seconds_count{integration=\"kafka-bridge\"}[5m]))", "legendFormat": "{{routeId}}", "refId": "A" }
+              ]
+            },
+            {
+              "id": 5,
+              "type": "timeseries",
+              "title": "JVM heap used",
+              "gridPos": { "h": 6, "w": 12, "x": 12, "y": 6 },
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "targets": [
+                { "expr": "sum(jvm_memory_used_bytes{integration=\"kafka-bridge\", area=\"heap\"})", "legendFormat": "heap used", "refId": "A" }
+              ]
+            },
+            {
+              "id": 6,
+              "type": "logs",
+              "title": "Integration logs (messages through the route)",
+              "gridPos": { "h": 10, "w": 24, "x": 0, "y": 12 },
+              "datasource": { "type": "loki", "uid": "loki" },
+              "options": { "showTime": true, "wrapLogMessage": true, "sortOrder": "Descending" },
+              "targets": [
+                { "expr": "{namespace=\"camel-k\", pod=~\"kafka-bridge.*\"}", "refId": "A" }
+              ]
+            },
+            {
+              "id": 7,
+              "type": "logs",
+              "title": "Bridged messages only",
+              "gridPos": { "h": 8, "w": 24, "x": 0, "y": 22 },
+              "datasource": { "type": "loki", "uid": "loki" },
+              "options": { "showTime": true, "wrapLogMessage": true, "sortOrder": "Descending" },
+              "targets": [
+                { "expr": "{namespace=\"camel-k\", pod=~\"kafka-bridge.*\"} |= \"Bridging message\"", "refId": "A" }
+              ]
+            }
+          ],
+          "schemaVersion": 39,
+          "version": 1
+        }

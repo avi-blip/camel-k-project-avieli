@@ -1,0 +1,63 @@
+# Offline Maven mirror: nginx serving the bundled m2 repository (maven repo layout).
+# Prereq: the repo is untarred on the node at /opt/maven-repo/m2
+#   (sudo mkdir -p /opt/maven-repo && sudo tar xzf maven/camel-k-m2.tgz -C /opt/maven-repo)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: maven-mirror
+  namespace: camel-k
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: maven-mirror
+  template:
+    metadata:
+      labels:
+        app: maven-mirror
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: repo
+              mountPath: /usr/share/nginx/html
+              readOnly: true
+      volumes:
+        - name: repo
+          hostPath:
+            path: /opt/maven-repo/m2
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: maven-mirror
+  namespace: camel-k
+spec:
+  selector:
+    app: maven-mirror
+  ports:
+    - port: 80
+      targetPort: 80
+---
+# Maven settings that force ALL artifact/plugin downloads through the mirror.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: maven-airgap-settings
+  namespace: camel-k
+data:
+  settings.xml: |
+    <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">
+      <mirrors>
+        <mirror>
+          <id>airgap-mirror</id>
+          <name>Air-gapped Maven mirror</name>
+          <url>http://maven-mirror.camel-k.svc.cluster.local</url>
+          <mirrorOf>*</mirrorOf>
+        </mirror>
+      </mirrors>
+    </settings>
