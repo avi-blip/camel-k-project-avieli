@@ -1,9 +1,11 @@
 # Air-Gapped Deployment Guide — Camel K + Kafka on RHEL / k3s
 
 Deploy Apache Camel K 2.10.1, a single-node Kafka, the `kafka-bridge` (Kafka→Kafka)
-integration, and a 5-second test-data producer on an **air-gapped RHEL server (x86_64)
-that already runs a k3s cluster** (e.g. on Nutanix AHV), using only the artifacts in
-this bundle. **No internet access is required at any step.**
+integration, a 5-second test-data producer, and (optionally) the `rate-limited-bridge`
+integration — per-client rate limiting backed by Redis, for Kafka and HTTP/HTTPS
+sources (§8.1) — on an **air-gapped RHEL server (x86_64) that already runs a k3s
+cluster** (e.g. on Nutanix AHV), using only the artifacts in this bundle.
+**No internet access is required at any step.**
 
 Key design decision: Camel K normally downloads Maven artifacts from the internet to
 build integration images. This bundle ships the **complete Maven repository** (validated:
@@ -19,20 +21,23 @@ on the correct CPU architecture, since images are built in-cluster.
 airgap-bundle/
 ├── AIRGAP-DEPLOY.md                ← this guide
 ├── images/
-│   ├── all-images-amd64.tar        ← all 5 container images, linux/amd64 (~700 MB)
+│   ├── all-images-amd64.tar        ← all 6 container images, linux/amd64 (~750 MB)
 │   └── image-list-amd64.txt
 ├── charts/
 │   └── camel-k-2.10.1.tgz          ← Camel K operator Helm chart
 ├── cli/linux-amd64/
 │   └── kubectl (v1.36.2), helm (v4.2.2), kamel (2.10.1)   ← static ELF x86-64 binaries
 ├── maven/
-│   └── camel-k-m2.tgz              ← complete Maven repo (~6,000 files, 197 MB compressed)
+│   └── camel-k-m2.tgz              ← complete Maven repo (~4,200 files, 199 MB compressed; incl. jedis + platform-http)
 └── manifests/
     ├── registry.yaml               ← in-cluster registry (NodePort 30500)
     ├── maven-mirror.yaml           ← nginx Maven mirror + settings.xml ConfigMap
-    ├── kafka.yaml                  ← namespace + single-node KRaft Kafka
-    ├── kafka-producer.yaml         ← produces a message to source-topic every 5 s
-    └── kafka-bridge.yaml           ← the Camel route (source-topic → sink-topic)
+    ├── kafka.yaml                  ← namespace + single-node KRaft Kafka (SASL/SCRAM-SHA-256) + credentials Secret
+    ├── kafka-producer.yaml         ← produces a message to source-topic every 5 s (SCRAM-authenticated)
+    ├── kafka-bridge.yaml           ← the Camel route (source-topic → sink-topic, SCRAM-authenticated)
+    ├── redis.yaml                  ← Redis (ns redis) — shared state for distributed rate limiting
+    ├── RateLimitedRoutes.java      ← per-client rate-limited routes (Kafka + HTTP/HTTPS), Redis token bucket
+    └── ingress-https.yaml          ← TLS ingress (Traefik, built into k3s) exposing the HTTP route as HTTPS
 ```
 
 Versions: Camel K 2.10.1 (runtime catalog 3.15.3, Camel 4.8.5, Quarkus/JVM mode, Jib publish,
@@ -40,7 +45,8 @@ base image `eclipse-temurin:17-jdk`) · Kafka 3.9.1 (KRaft, `apache/kafka`) · r
 nginx:1.27-alpine.
 
 Images in the tar: `apache/camel-k:2.10.1`, `apache/kafka:3.9.1`, `registry:2`,
-`eclipse-temurin:17-jdk` (Jib base image — required for builds), `nginx:1.27-alpine`.
+`eclipse-temurin:17-jdk` (Jib base image — required for builds), `nginx:1.27-alpine`,
+`redis:7.4-alpine` (rate-limiter state).
 
 ## 2. Assumptions & prerequisites
 
@@ -136,6 +142,13 @@ kubectl wait integrationplatform/camel-k -n camel-k \
 
 ## 7. Kafka, topics, and the 5-second producer
 
+The broker requires **SASL/SCRAM-SHA-256** on its client listener (9092). Credentials
+come from the `kafka-scram-credentials` Secret in `manifests/kafka.yaml` (default
+`camel` / `camel-bridge-2026` — **edit the Secret before deploying** if this reaches
+anything shared). The SCRAM user is registered automatically on broker start; a
+loopback-only PLAINTEXT listener on 9094 exists inside the pod for admin commands,
+which is what the topic-creation commands below use.
+
 ```bash
 kubectl apply -f manifests/kafka.yaml
 kubectl rollout status deployment/kafka -n kafka --timeout=300s
@@ -143,7 +156,7 @@ kubectl rollout status deployment/kafka -n kafka --timeout=300s
 POD=$(kubectl get pod -n kafka -l app=kafka -o jsonpath='{.items[0].metadata.name}')
 for t in source-topic sink-topic; do
   kubectl exec -n kafka $POD -- /opt/kafka/bin/kafka-topics.sh \
-    --bootstrap-server localhost:9092 --create --topic $t --partitions 1 --replication-factor 1
+    --bootstrap-server localhost:9094 --create --topic $t --partitions 1 --replication-factor 1
 done
 
 # Continuous test data: one timestamped message to source-topic every 5 seconds
@@ -153,8 +166,16 @@ kubectl logs -n kafka deployment/kafka-producer -f   # "produced: auto-msg-N <ti
 
 ## 8. Deploy the integration (built offline, in-cluster)
 
+The route authenticates with SCRAM via `{{kafka.user}}`/`{{kafka.password}}`
+placeholders, resolved from the `kafka-scram-credentials` Secret — copy it into the
+`camel-k` namespace and pass it to `kamel run`:
+
 ```bash
-kamel run manifests/kafka-bridge.yaml -n camel-k --name kafka-bridge
+kubectl get secret kafka-scram-credentials -n kafka -o yaml \
+  | sed 's/namespace: kafka/namespace: camel-k/' | kubectl apply -f -
+
+kamel run manifests/kafka-bridge.yaml -n camel-k --name kafka-bridge \
+  --config secret:kafka-scram-credentials
 
 # First build fetches ~2,800 artifacts from the mirror; takes ~1–3 min
 kubectl wait integration/kafka-bridge -n camel-k --for=condition=Ready --timeout=600s
@@ -167,16 +188,68 @@ Multi-node note: `maven-mirror` and `registry` use hostPath volumes — pin them
 holding `/opt/maven-repo` and `/opt/registry-storage` with a nodeSelector, or put the data
 on shared storage (e.g. Nutanix Files/Volumes).
 
+## 8.1 Optional: per-client rate limiting (Redis token bucket — Kafka + HTTP/HTTPS)
+
+`manifests/RateLimitedRoutes.java` runs one route per client, each with its own SLA
+enforced **globally across all pods**: the limiter is a token bucket evaluated as an
+atomic Lua script in Redis (using the Redis server clock), so scaling the integration
+up/down never changes a client's aggregate rate. Kafka routes *block* when over-limit
+(backpressure, nothing dropped); the HTTP/HTTPS route rejects with `429 + Retry-After`.
+Default clients (edit rates in the source): `client-a` Kafka 5 msg/s, `client-b` Kafka
+2 msg/s, `client-c` HTTP `/ingest/client-c` 3 req/s.
+
+```bash
+kubectl apply -f manifests/redis.yaml
+kubectl rollout status deployment/redis -n redis --timeout=180s
+
+# Per-client topics: 3 partitions on sources so multiple pods can share consumption
+POD=$(kubectl get pod -n kafka -l app=kafka -o jsonpath='{.items[0].metadata.name}')
+for t in client-a-topic:3 client-b-topic:3 client-a-sink:1 client-b-sink:1 client-c-sink:1; do
+  kubectl exec -n kafka $POD -- /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9094 \
+    --create --if-not-exists --topic ${t%%:*} --partitions ${t##*:} --replication-factor 1
+done
+
+# Requires the kafka-scram-credentials Secret in camel-k (already copied in §8)
+kamel run manifests/RateLimitedRoutes.java -n camel-k --name rate-limited-bridge \
+  --config secret:kafka-scram-credentials -d mvn:redis.clients:jedis:5.2.0
+kubectl wait integration/rate-limited-bridge -n camel-k --for=condition=Ready --timeout=600s
+
+# HTTPS: TLS-terminating ingress via the Traefik that ships with k3s
+openssl req -x509 -newkey rsa:2048 -keyout tls.key -out tls.crt -days 365 -nodes \
+  -subj "/CN=ratelimit.local" -addext "subjectAltName=DNS:ratelimit.local"
+kubectl create secret tls ratelimit-tls -n camel-k --cert=tls.crt --key=tls.key
+kubectl apply -f manifests/ingress-https.yaml
+```
+
+Scale with `kubectl scale integration rate-limited-bridge -n camel-k --replicas=2` —
+**not** `kubectl scale deployment`, which the operator immediately reverts. The per-client
+rate stays at the configured SLA regardless of replica count (verified: identical
+aggregate throughput at 1 and 2 pods).
+
+Quick checks: HTTP from inside the cluster answers `202` until the bucket empties, then
+`429` (`curl http://rate-limited-bridge.camel-k/ingest/client-c`); HTTPS via the ingress
+(`curl -k --resolve ratelimit.local:443:<NODE_IP> https://ratelimit.local/ingest/client-c`).
+All Maven artifacts for this integration (`redis.clients:jedis` + camel-quarkus-platform-http)
+are included in the bundled Maven repo.
+
 ## 9. End-to-end verification
 
 The producer feeds `source-topic` every 5 s, so the pipeline is already flowing:
 
 ```bash
-# Messages arriving at the sink (Ctrl-C to stop)
+# Messages arriving at the sink, consumed over the SCRAM-authenticated listener
 POD=$(kubectl get pod -n kafka -l app=kafka -o jsonpath='{.items[0].metadata.name}')
-kubectl exec -n kafka $POD -- /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 --topic sink-topic --from-beginning --timeout-ms 20000
+kubectl exec -n kafka $POD -- sh -c 'cat > /tmp/client.properties <<EOF
+security.protocol=SASL_PLAINTEXT
+sasl.mechanism=SCRAM-SHA-256
+sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="$SCRAM_USER" password="$SCRAM_PASSWORD";
+EOF
+/opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka.kafka.svc.cluster.local:9092 \
+  --consumer.config /tmp/client.properties \
+  --topic sink-topic --from-beginning --timeout-ms 20000'
 # → a stream of "auto-msg-N <timestamp>" lines
+# (without --consumer.config the same command fails: the listener rejects unauthenticated clients)
 
 # Same messages crossing the Camel route
 kamel logs kafka-bridge -n camel-k    # "Bridging message: auto-msg-N ..."
@@ -187,8 +260,9 @@ kamel logs kafka-bridge -n camel-k    # "Bridging message: auto-msg-N ..."
 | Capability | Offline? |
 |---|---|
 | Running + rebuilding `kafka-bridge` | ✅ fully validated (cold build, 2,812 artifacts from mirror) |
-| New integrations using camel:kafka / log / yaml-dsl | ✅ same dependency set |
-| New integrations with **other** camel components (e.g. camel:http, camel:sql) | ⚠️ only after adding their artifacts to the mirror (see below) |
+| Running + rebuilding `rate-limited-bridge` (kafka + platform-http + jedis) | ✅ artifacts included in the bundled repo |
+| New integrations using camel:kafka / camel:platform-http / log / yaml-dsl / java | ✅ same dependency set |
+| New integrations with **other** camel components (e.g. camel:sql) | ⚠️ only after adding their artifacts to the mirror (see below) |
 | Native/Quarkus-native builds | ❌ not bundled |
 
 To extend the mirror: on any online machine run a Camel K build (or `mvn dependency:go-offline`
@@ -207,3 +281,5 @@ No restart needed — nginx serves them immediately.
 | Integration pod `ErrImagePull` from `<NODE_IP>:30500` | `/etc/rancher/k3s/registries.yaml` missing/typo → kubelet tries HTTPS. Fix and `sudo systemctl restart k3s` |
 | IntegrationPlatform not Ready | `kubectl logs -n camel-k deploy/camel-k-operator` |
 | No messages on sink-topic | `kubectl logs -n kafka deployment/kafka-producer` (producing?) then `kamel logs kafka-bridge -n camel-k` (bridging?) |
+| Client logs `disconnected` / broker logs `Failed authentication ... during SASL handshake` | Client is missing SASL config or has wrong credentials. Bridge: secret copied to `camel-k` ns and `--config secret:kafka-scram-credentials` passed? Changed the password? Restart the kafka pod (postStart re-registers the SCRAM user) and re-copy the secret. |
+| Kafka pod restarts right after start (postStart failure event) | `kubectl describe pod -n kafka <pod>` — the postStart hook timed out registering the SCRAM user; check broker logs for startup errors. |

@@ -3,6 +3,30 @@ kind: Namespace
 metadata:
   name: kafka
 ---
+# Default dev credentials — change the password before any real deployment.
+# Also consumed by the Camel K integration: copy this Secret into the camel-k
+# namespace and pass it with `kamel run --config secret:kafka-scram-credentials`.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kafka-scram-credentials
+  namespace: kafka
+type: Opaque
+stringData:
+  kafka.user: camel
+  kafka.password: camel-bridge-2026
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-jaas
+  namespace: kafka
+data:
+  kafka_jaas.conf: |
+    KafkaServer {
+      org.apache.kafka.common.security.scram.ScramLoginModule required;
+    };
+---
 apiVersion: v1
 kind: Service
 metadata:
@@ -41,14 +65,23 @@ spec:
               value: "1"
             - name: KAFKA_PROCESS_ROLES
               value: broker,controller
+            # CLIENT (9092): SASL/SCRAM-SHA-256, the only listener exposed by the Service.
+            # INTERNAL (9094): plaintext, bound to loopback only — inter-broker traffic and
+            # in-pod admin commands (topic creation, SCRAM user bootstrap).
             - name: KAFKA_LISTENERS
-              value: PLAINTEXT://:9092,CONTROLLER://:9093
+              value: CLIENT://:9092,INTERNAL://localhost:9094,CONTROLLER://:9093
             - name: KAFKA_ADVERTISED_LISTENERS
-              value: PLAINTEXT://kafka.kafka.svc.cluster.local:9092
+              value: CLIENT://kafka.kafka.svc.cluster.local:9092,INTERNAL://localhost:9094
             - name: KAFKA_CONTROLLER_LISTENER_NAMES
               value: CONTROLLER
             - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
-              value: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+              value: CLIENT:SASL_PLAINTEXT,INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: INTERNAL
+            - name: KAFKA_SASL_ENABLED_MECHANISMS
+              value: SCRAM-SHA-256
+            - name: KAFKA_OPTS
+              value: -Djava.security.auth.login.config=/etc/kafka/jaas/kafka_jaas.conf
             - name: KAFKA_CONTROLLER_QUORUM_VOTERS
               value: 1@localhost:9093
             - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
@@ -59,9 +92,46 @@ spec:
               value: "1"
             - name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS
               value: "0"
+            - name: SCRAM_USER
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-scram-credentials
+                  key: kafka.user
+            - name: SCRAM_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-scram-credentials
+                  key: kafka.password
+          volumeMounts:
+            - name: jaas
+              mountPath: /etc/kafka/jaas
+              readOnly: true
+          # SCRAM credentials live in the KRaft metadata log (not in JAAS), so the user
+          # is (re)registered on every start via the loopback listener. Idempotent.
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    for i in $(seq 1 90); do
+                      if /opt/kafka/bin/kafka-configs.sh --bootstrap-server localhost:9094 \
+                           --alter --entity-type users --entity-name "$SCRAM_USER" \
+                           --add-config "SCRAM-SHA-256=[iterations=8192,password=$SCRAM_PASSWORD]"; then
+                        exit 0
+                      fi
+                      sleep 2
+                    done
+                    echo "timed out registering SCRAM user $SCRAM_USER" >&2
+                    exit 1
           resources:
             requests:
               memory: 512Mi
               cpu: 250m
             limits:
-              memory: 1Gi
+              memory: 1536Mi
+      volumes:
+        - name: jaas
+          configMap:
+            name: kafka-jaas

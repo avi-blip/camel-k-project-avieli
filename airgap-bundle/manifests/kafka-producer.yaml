@@ -1,4 +1,5 @@
 # Test-data generator: produces one timestamped message to source-topic every 5 seconds.
+# Authenticates to the broker with SASL/SCRAM-SHA-256 (kafka-scram-credentials secret).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -18,14 +19,31 @@ spec:
         - name: producer
           image: apache/kafka:3.9.1
           command: ["/bin/sh", "-c"]
+          env:
+            - name: SCRAM_USER
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-scram-credentials
+                  key: kafka.user
+            - name: SCRAM_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-scram-credentials
+                  key: kafka.password
           args:
             - |
+              cat > /tmp/client.properties <<EOF
+              security.protocol=SASL_PLAINTEXT
+              sasl.mechanism=SCRAM-SHA-256
+              sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="${SCRAM_USER}" password="${SCRAM_PASSWORD}";
+              EOF
               i=0
               while true; do
                 i=$((i+1))
                 msg="auto-msg-$i $(date -u +%Y-%m-%dT%H:%M:%SZ)"
                 echo "$msg" | /opt/kafka/bin/kafka-console-producer.sh \
                   --bootstrap-server kafka.kafka.svc.cluster.local:9092 \
+                  --producer.config /tmp/client.properties \
                   --topic source-topic
                 echo "produced: $msg"
                 sleep 5
