@@ -15,11 +15,19 @@ import redis.clients.jedis.JedisPooled;
  *
  * Source semantics:
  *  - Kafka consumers BLOCK until a token is available (backpressure, no data loss).
- *  - HTTP/HTTPS reject over-limit requests with 429 + Retry-After (client retries).
+ *  - HTTP and HTTPS each have a SEPARATE Camel route and a SEPARATE Redis bucket per client.
+ *    The rate-limit decision is made inside the route — not at an ingress or proxy. Routes
+ *    are separated by path (/ingest/client-c for HTTP, /ingest/client-c-secure for HTTPS)
+ *    and by NodePort (30080 → 8080 plain, 30443 → 8443 TLS). Future: Ingress can unify
+ *    the path once HTTPS-via-Ingress is ready.
  *
  * Run with:
  *   kamel run rate-limit/RateLimitedRoutes.java --name rate-limited-bridge \
- *     --config secret:kafka-scram-credentials -d mvn:redis.clients:jedis:5.2.0
+ *     --config secret:kafka-scram-credentials -d mvn:redis.clients:jedis:5.2.0 \
+ *     --resource secret:ratelimit-tls@/etc/tls \
+ *     -p quarkus.http.ssl-port=8443 \
+ *     -p quarkus.http.ssl.certificate.files=/etc/tls/tls.crt \
+ *     -p quarkus.http.ssl.certificate.key-files=/etc/tls/tls.key
  */
 public class RateLimitedRoutes extends RouteBuilder {
 
@@ -48,14 +56,33 @@ public class RateLimitedRoutes extends RouteBuilder {
             .process(e -> limiter.acquireBlocking("client-b", 2.0, 4))
             .to("kafka:client-b-sink?" + KAFKA_PARAMS);
 
-        // client-c: HTTP(S) source, SLA 3 req/s, burst up to 6 — over-limit requests get 429
+        // client-c HTTP: 3 req/s, burst 6. Separate Redis bucket from HTTPS.
+        // Reached via NodePort 30080 → pod :8080. Rate-limit enforced in this Camel route.
         from("platform-http:/ingest/client-c")
             .routeId("client-c-http")
             .process(e -> {
-                if (!limiter.tryAcquire("client-c", 3.0, 6)) {
+                if (!limiter.tryAcquire("client-c-http", 3.0, 6)) {
                     e.getMessage().setHeader(Exchange.HTTP_RESPONSE_CODE, 429);
                     e.getMessage().setHeader("Retry-After", "1");
-                    e.getMessage().setBody("rate limit exceeded for client-c\n");
+                    e.getMessage().setBody("rate limit exceeded for client-c (http)\n");
+                    e.setRouteStop(true);
+                }
+            })
+            .to("kafka:client-c-sink?" + KAFKA_PARAMS)
+            .setHeader(Exchange.HTTP_RESPONSE_CODE, constant(202))
+            .setBody(constant("accepted\n"));
+
+        // client-c HTTPS: separate Redis bucket. TLS terminated in the pod (Quarkus/Vert.x,
+        // cert from ratelimit-tls secret). Reached via NodePort 30443 → pod :8443.
+        // Different path (/ingest/client-c-secure) keeps the two routes truly distinct at the
+        // Camel level — no ingress involved. Future work: unify to /ingest/client-c via Ingress.
+        from("platform-http:/ingest/client-c-secure")
+            .routeId("client-c-https")
+            .process(e -> {
+                if (!limiter.tryAcquire("client-c-https", 3.0, 6)) {
+                    e.getMessage().setHeader(Exchange.HTTP_RESPONSE_CODE, 429);
+                    e.getMessage().setHeader("Retry-After", "1");
+                    e.getMessage().setBody("rate limit exceeded for client-c (https)\n");
                     e.setRouteStop(true);
                 }
             })
